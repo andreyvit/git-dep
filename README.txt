@@ -157,6 +157,11 @@ repositories before commiting the dependent ones.
 Maintainer and license
 ----------------------
 
-This script is licensed under GNU General Public License v2 (or any newer version at your preference).
+This script is licensed under GNU General Public License v2
+(or any newer version at your preference).
 
-It is maintained by Andrey Tarantsov. Report bugs to andreyvit@gmail.com.
+It is maintained by Andrey Tarantsov <andreyvit@gmail.com>.
+
+Please file bugs, feature requests and ideas to our bug tracker at:
+        http://yoursway.lighthouseapp.com/projects/19977-git-dep/
+
