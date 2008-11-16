@@ -23,6 +23,11 @@ say() {
 	! $quiet && echo >&2 "$*"
 }
 
+die_init() {
+  die "Dependency tracking is not enabled for this repository.
+Please run git dep init, or git dep -h for help."
+}
+
 # list_dependencies <config-file>
 list_dependencies() {
   git config -f "$1" --get-regexp '^dep\..*\.commitid' | awk -F. '{ print $2 }'
@@ -75,14 +80,14 @@ clone_repository() {
 
 # checkout_repository name path
 checkout_repository() {
-  say "Repository $current_name depends on $1."
-  
   commitid="$(git config -f "$config_file" "dep.$1.commitid")"
   test -z "$commitid" &&
     die "$current_name does not depend on $1, so cannot check it out."
   branch="$(git config -f "$config_file" "dep.$1.branch")"
   test -z "$branch" &&
     die "Checking out $1 is impossible because no branch is recorded for it in $deps_filename."
+    
+  say "Repository $current_name depends on $1 : $commitid."
   
   cur_commitid="$(cd "$2"; git rev-parse HEAD)" ||
       die "Cannot fetch commit id from repository $child_name".
@@ -117,7 +122,7 @@ checkout_repository() {
         *)
           say "  -> $1's HEAD is on a descendant of the correct revision, but on branch $cur_branch instead of $branch.";;
       esac
-      say "     (use -o to check out exact revisions)."
+      say "     (use -o to check out the exact revision)."
       exit 0
     }
   fi
@@ -134,7 +139,7 @@ checkout_repository() {
   ! $old && test -z "$(cd "$2"; git rev-list $branch..$commitid)" && {
     (cd "$2"; git checkout $branch) ||
       die "Failed to checkout $branch."
-    say "  -> checked out $branch (use -o to check out exact revisions)."
+    say "  -> checked out $branch (use -o to check out the exact revision)."
     exit 0
   }
   
@@ -148,7 +153,7 @@ checkout_repository() {
     # if HEAD is newer but still okay, do not touch anything
     ! $old && test -z "$(cd "$2"; git rev-list HEAD..$commitid)" && {
       say "  -> $1's HEAD is on a descendant of the correct revision, on branch $branch-oldver (!)"
-      say "     (use -o to check out exact revisions)."
+      say "     (use -o to check out the exact revision)."
       exit 0
     }
   fi
@@ -292,7 +297,7 @@ dependent repositories. This URL can be changed with:
 
 cmd_add() {
   test -f "$config_file" ||
-    die "Dependency tracking is not enabled for this repository. Please run git dep init, or git dep -h for help."
+    die_init
     
   # parse
   break=false
@@ -319,6 +324,9 @@ cmd_add() {
 }
 
 cmd_remove() {
+  test -f "$config_file" ||
+    die_init
+
   # parse
   break=false
   while test $# != 0 && ! $break; do
@@ -337,6 +345,9 @@ cmd_remove() {
 }
 
 cmd_record() {
+  test -f "$config_file" ||
+    die_init
+
   # parse
   break=false
   while test $# != 0 && ! $break; do
@@ -366,6 +377,9 @@ cmd_record() {
 }
 
 cmd_clone() {
+  test -f "$config_file" ||
+    die_init
+
   # defaults
   target="$(cd ..; pwd)"
   
@@ -401,6 +415,9 @@ cmd_clone() {
 }
 
 cmd_checkout() {
+  test -f "$config_file" ||
+    die_init
+
   # defaults
   old=false
   
@@ -434,6 +451,46 @@ cmd_checkout() {
     done
   fi
   exit $status
+}
+
+# status_walker config_file
+status_walker() {
+  for repos in $(list_dependencies "$1"); do
+    path="$(find_repository "$repos")"
+    if test -z "$path" || ! test -d "$path"; then
+      branch="<MISSING>"
+      deps=""
+    else
+      branch="$(read_branch "$path")"
+      if ! test -f "$path/$deps_filename"; then
+        deps="N/A"
+      else
+        deps="$(list_dependencies "$path/$deps_filename" | wc -l | sed 's/ //g')"
+      fi
+    fi
+    printf "$fmt" "$repos" "$branch" "$deps" "$path"
+    # test -n "$path" && test -d "$path" && status_walker "$path/$deps_filename"
+  done
+}
+
+cmd_status() {
+  test -f "$config_file" ||
+    die_init
+
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                die "No arguments expected. $USAGEREF";;
+    esac
+  done
+
+  fmt="%-15s %-15s %-4s %s\n"
+  printf "$fmt" "NAME" "BRANCH" "DEPS" "PATH"
+  status_walker "$config_file"
+  echo
+  echo "TOTAL: $(list_dependencies "$config_file" | wc -l) dependencies."
 }
 
 cmd_all() {
