@@ -3,9 +3,12 @@ ORIG_DIR="$(pwd)"
 USAGE="[options] init|clone|checkout|record|status|add|remove|-h"
 OPTIONS_SPEC=
 LONG_USAGE="\
-git dep init [<name>]       enabled dependecy tracking for repository
-git dep clone               clones any missing dependencies
-git dep checkout            checks out specific revisions of dependencies
+git dep init [-f] [<name>]  
+                            enables dependency tracking for repository
+git dep clone [-D <target-dir>] [name...]
+                            clones all missing/specified dependencies
+git dep checkout [-o|--old]
+                            checks out the specific revisions of dependencies
 git dep record              records current revision in all dependent repositories
 git dep status              shows status of all dependencies
 git dep add <path>          adds a new dependency
@@ -17,7 +20,7 @@ USAGEREF="Run $dashless -h for usage."
 require_work_tree
 
 say() {
-	$quiet || echo "$*"
+	! $quiet && echo >&2 "$*"
 }
 
 # list_dependencies <config-file>
@@ -33,49 +36,159 @@ find_repository() {
   git config --global --get "repos.$1.path"
 }
 
-cmd_init() {
-  # defaults
-  force=false
-  
-  # parse
-  break=false
-  while test $# != 0 && ! $break; do
-    case "$1" in
-      -f | --force)     force=true; shift;;
-      -*)               die "Invalid option $1. $USAGEREF";;
-      *)                break=true;;
-    esac
-  done
-  name="$1"
-  
-  test -n "$current_name" && {
-    $force || test -z "$name" || die "Name already set. Use -f to overwrite."
-    test -n "$name" && say "Forced overwriting of old name $oldname."
-  }
-  test -z "$name" && name="$current_name"
-  test -z "$name" && name="$(basename "$(pwd)")"
-  test "$name" != "$current_name" &&
-    git config -f "$config_file" repos.name "$name"
-  git config --global "repos.$name.path" "$(pwd)"
-  
-  say "Dependency tracking initialized, repository is now known as '$name'."
-  url="$(git config remote.origin.url)"
+find_existing_repository() {
+  dep="$1"
+  path="$(find_repository "$1")"
+  if test -z "$path"; then
+    say "Repository $current_name depends on $1, which has not been found."
+    say "  -> If you already have it somewhere, run 'git dep init $1' in that folder."
+    say "  -> If you do not have it and want to download it, run 'git dep clone' now."
+    say "  -> To remove this dependency, run 'git dep remove $1'."
+  else
+    name="$(git config -f "$path/$deps_filename" repos.name)"
+    if test "$name" != "$1"; then
+      say "Repository $current_name depends on $1, which is registered at $path."
+      say "However the repository found at that path is named $name."
+      say "  -> To fix the name of the repository, run 'git dep init -f $1' in $path."
+      say "  -> If you have $1 somewhere else, run 'git dep init $1' in that folder."
+      say "  -> To remove this dependency, run 'git dep remove $1'."
+    else
+      echo "$path"
+    fi
+  fi
+}
+
+# clone_repository name
+clone_repository() {
+  check="$(git config -f "$config_file" "dep.$1.commitid")"
+  test -z "$check" &&
+    die "$current_name does not depend on $1, so cannot clone it."
+  url="$(git config -f "$config_file" "dep.$1.url")"
   test -z "$url" &&
-    echo "Warning: remote 'origin' does not exist. Dependent repositories would not
-be able to record a URL to clone from, and thus git dep clone won't work.
-It is highly recommended to set up remote 'origin'."
-  test -n "$url" &&
-    echo "
-NOTE: Dependent repositories will be setup to clone the origin URL,
-i.e. a URL pointed to by remote 'origin'. Currently it is:
+    die "Cloning $1 is impossible because no clone URL is recorded in $deps_filename."
+  say "Cloning $url as $1."
+  (cd "$2"; git clone $url $1) ||
+    die "Failed to clone $url."
+  (cd "$2/$1"; git dep -q init) ||
+    die "Failed to enable dependency tracking for $2/$1."
+}
 
-    $url
+# checkout_repository name path
+checkout_repository() {
+  say "Repository $current_name depends on $1."
+  
+  commitid="$(git config -f "$config_file" "dep.$1.commitid")"
+  test -z "$commitid" &&
+    die "$current_name does not depend on $1, so cannot check it out."
+  branch="$(git config -f "$config_file" "dep.$1.branch")"
+  test -z "$branch" &&
+    die "Checking out $1 is impossible because no branch is recorded for it in $deps_filename."
+  
+  cur_commitid="$(cd "$2"; git rev-parse HEAD)" ||
+      die "Cannot fetch commit id from repository $child_name".
+  
+  cur_branch="$(read_branch "$2")"
+  
+  # check if the required commit exists
+  (cd "$2"; git cat-file commit $commitid >/dev/null 2>&1) || 
+    die "  -> the required commit id does not exist. rebase/amend has happened?"
 
-Please check that the above address is valid, as it will be recorded in all
-dependent repositories. This URL can be changed with:
+  if test "$cur_branch" != "$branch-oldver"; then
+    # if HEAD is okay, do not touch anything
+    test "$commitid" == "$cur_commitid" && {
+      case "$cur_branch" in
+        $branch)
+          say "  -> $1's HEAD is on the correct revision, on branch $branch.";;
+        '<detached>')
+          say "  -> $1's HEAD is on the correct revision, the HEAD is detached (!)";;
+        *)
+          say "  -> $1's HEAD is on the correct revision, but on branch $cur_branch instead of $branch.";;
+      esac
+      exit 0
+    }
+  
+    # if HEAD is newer but still okay, do not touch anything
+    ! $old && test -z "$(cd "$2"; git rev-list HEAD..$commitid)" && {
+      case "$cur_branch" in
+        $branch)
+          say "  -> $1's HEAD is on a descendant of the correct revision, on $branch.";;
+        '<detached>')
+          say "  -> $1's HEAD is on a descendant of the correct revision, the HEAD is detached (!)";;
+        *)
+          say "  -> $1's HEAD is on a descendant of the correct revision, but on branch $cur_branch instead of $branch.";;
+      esac
+      say "     (use -o to check out exact revisions)."
+      exit 0
+    }
+  fi
 
-    git config remote.origin.url <new-url-here>
-"
+  # check if the correct branch is suitable as-is
+  test "$commitid" == "$(cd "$2"; git rev-parse $branch)" && {
+    (cd "$2"; git checkout $branch) ||
+      die "Failed to checkout $branch."
+    say "  -> checked out $branch."
+    exit 0
+  }
+
+  # check if the correct branch is suitable as-is as a descendant
+  ! $old && test -z "$(cd "$2"; git rev-list $branch..$commitid)" && {
+    (cd "$2"; git checkout $branch) ||
+      die "Failed to checkout $branch."
+    say "  -> checked out $branch (use -o to check out exact revisions)."
+    exit 0
+  }
+  
+  if test "$cur_branch" == "$branch-oldver"; then
+    # if HEAD is okay, do not touch anything
+    test "$commitid" == "$cur_commitid" && {
+      say "  -> $1's HEAD is on the correct revision, on branch $branch-oldver (!)"
+      exit 0
+    }
+  
+    # if HEAD is newer but still okay, do not touch anything
+    ! $old && test -z "$(cd "$2"; git rev-list HEAD..$commitid)" && {
+      say "  -> $1's HEAD is on a descendant of the correct revision, on branch $branch-oldver (!)"
+      say "     (use -o to check out exact revisions)."
+      exit 0
+    }
+  fi
+  
+  if (cd "$2"; git rev-parse $branch-oldver >/dev/null 2>&1); then
+    # check if the oldver branch is suitable as-is
+    test "$commitid" == "$(cd "$2"; git rev-parse $branch-oldver)" && {
+      (cd "$2"; git checkout $branch-oldver) ||
+        die "Failed to check out $branch-oldver."
+      say "  -> checked out $branch-oldver, which is on the correct commit id."
+      exit 0
+    }
+  
+    # check if we can trash oldver
+    test -n "$(cd "$2"; git rev-list $branch..$branch-oldver)" && {
+      say "  -> cannot trash $branch-oldver because it has commits not found in $branch."
+      say "     * if you made any new commits on $branch-oldver, please merge them into $branch"
+      say "     * if you are sure there is nothing valuable on $branch-oldver, pls run"
+      if test "$cur_branch" != "$branch-oldver"; then
+        say "       (cd "$2"; git branch -D $branch-oldver)"
+      else
+        say "       (cd "$2"; git checkout -f $branch; git branch -D $branch-oldver)"
+      fi
+      exit 1
+    }
+    if test "$cur_branch" != "$branch-oldver"; then
+      (cd "$2"; git branch -f $branch-oldver $commitid) || 
+        die "Failed to force-set $branch-oldver to the required commit id."
+      (cd "$2"; git checkout $branch-oldver) ||
+        die "Failed to checkout $branch-oldver."
+    else
+      (cd "$2"; git reset --hard $commitid) || 
+        die "Failed to reset $branch-oldver to the required commit id."
+    fi
+  else
+    (cd "$2"; git checkout -b $branch-oldver $commitid) ||
+      die "Failed to create branch $branch-oldver."
+  fi
+
+  say "  -> created branch $branch-oldver, checked out the correct revision. enjoy."
 }
 
 read_branch() {
@@ -112,7 +225,7 @@ record_dependency() {
   esac
   
   url="$(git config -f "$child_dir/.git/config" remote.origin.url)"
-  commitid="$(export GIT_DIR="$child_dir/.git"; git-rev-parse HEAD)" ||
+  commitid="$(export GIT_DIR="$child_dir/.git"; git rev-parse HEAD)" ||
     die "Cannot fetch commit id from repository $child_name".
   say "Repository $parent_name depends on $child_name."
   test "$commitid" != "$oldcommitid" && {
@@ -130,6 +243,51 @@ record_dependency() {
       die "Cannot write branch to $parent_config."
     say "  -> updated branch: $branch."
   }
+}
+
+cmd_init() {
+  # defaults
+  force=false
+  
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -f | --force)     force=true; shift;;
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                break=true;;
+    esac
+  done
+  name="$1"
+  
+  test -n "$current_name" && {
+    $force || test -z "$name" || die "Name already set. Use -f to overwrite."
+    test -n "$name" && say "Forced overwriting of old name $oldname."
+  }
+  test -z "$name" && name="$current_name"
+  test -z "$name" && name="$(basename "$(pwd)")"
+  test "$name" != "$current_name" &&
+    git config -f "$config_file" repos.name "$name"
+  git config --global "repos.$name.path" "$(pwd)"
+  
+  say "Dependency tracking initialized, repository is now known as '$name'."
+  url="$(git config remote.origin.url)"
+  test -z "$url" &&
+    say "Warning: remote 'origin' does not exist. Dependent repositories would not
+be able to record a URL to clone from, and thus git dep clone won't work.
+It is highly recommended to set up remote 'origin'."
+  test -n "$url" &&
+    say "
+NOTE: Dependent repositories will be setup to clone the origin URL,
+i.e. a URL pointed to by remote 'origin'. Currently it is:
+
+    $url
+
+Please check that the above address is valid, as it will be recorded in all
+dependent repositories. This URL can be changed with:
+
+    git config remote.origin.url <new-url-here>
+"
 }
 
 cmd_add() {
@@ -188,38 +346,94 @@ cmd_record() {
     esac
   done
     
-  say "Checking repositories $current_name depends on..."
+  say "Step 1. Checking repositories $current_name depends on."
   for dep in $(list_dependencies "$config_file"); do
-    path="$(find_repository "$dep")"
-    if test -z "$path"; then
-      echo "Dependency not found: $dep."
-      echo "  -> If you already have it somewhere, run git dep init in that folder."
-      echo "  -> If you do not have it and want to download it, run git dep clone now."
-    else
-      name="$(git config -f "$path/$deps_filename" repos.name)"
-      if test "$name" != "$dep"; then
-        echo "Dependency $dep is registered at path $path."
-        echo "However the repository found at that path is named $name."
-        echo "  -> To fix the name of repository, run git dep init -f in $path."
-        echo "  -> If you have $dep somewhere else, run git dep init in that folder."
-        echo "  -> To remove this dependency, run git dep remove $dep."
-      else
-        record_dependency "$current_name" "$config_file" "$dep" "$path"
-      fi
-    fi
+    path="$(find_existing_repository "$dep")"
+    test -n "$path" && record_dependency "$current_name" "$config_file" "$dep" "$path"
   done
   
-  say "Checking repositories that depend on $current_name..."
+  say "Step 2. Checking repositories that depend on $current_name."
   for repos in $(list_repositories); do
     path="$(git config --global --get "repos.$repos.path")"
     if ! test -f "$path/$deps_filename"; then
-      echo "Skipped checking of $repos because no .$deps_filename found in it."
+      say "Skipped checking of $repos because no .$deps_filename found in it."
     else
       dep="$(git config -f "$path/$deps_filename" --get "dep.$current_name.commitid")"
       test -n "$dep" &&
         record_dependency "$repos" "$path/$deps_filename" "$current_name" "$(pwd)"
     fi
   done
+}
+
+cmd_clone() {
+  # defaults
+  target="$(cd ..; pwd)"
+  
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -D)               shift; target="$1"; shift;;
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                break=true;;
+    esac
+  done
+  
+  status=0
+  test -d "$target" ||
+    die "The specified target directory does not exist: $target."
+  if test $# == 0; then
+    say "Cloning all missing dependencies of $current_name into $target."
+    for dep in $(list_dependencies "$config_file"); do
+      path="$(find_repository "$dep")"
+      test -z "$path" || ! test -d "$path" && {
+        (clone_repository "$dep" "$target") || status=1
+      }
+    done
+  else
+    say "Cloning the specified dependencies into $target."
+    while test $# != 0; do
+      (clone_repository "$1" "$target") || status=1
+      shift
+    done
+  fi
+  exit $status
+}
+
+cmd_checkout() {
+  # defaults
+  old=false
+  
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -o | --old)       old=true; shift;;
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                break=true;;
+    esac
+  done
+  
+  status=0
+  if test $# == 0; then
+    say "Updating all dependencies of $current_name."
+    for dep in $(list_dependencies "$config_file"); do
+      path="$(find_existing_repository "$dep")"
+      test -n "$path" && {
+        (checkout_repository "$dep" "$path") || status=1
+      }
+    done
+  else
+    say "Updating the specified dependencies."
+    while test $# != 0; do
+      path="$(find_existing_repository "$dep")"
+      test -n "$path" && {
+        (checkout_repository "$dep" "$path") || status=1
+      }
+      shift
+    done
+  fi
+  exit $status
 }
 
 cmd_all() {
