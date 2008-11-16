@@ -223,6 +223,15 @@ cmd_record() {
 }
 
 cmd_all() {
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                die "No arguments expected. $USAGEREF";;
+    esac
+  done
+  
   fmt="%-15s %-15s %-4s %s\n"
   printf "$fmt" "NAME" "BRANCH" "DEPS" "PATH"
   for repos in $(list_repositories); do
