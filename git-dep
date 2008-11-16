@@ -1,0 +1,266 @@
+#! /bin/sh
+ORIG_DIR="$(pwd)"
+USAGE="[options] init|clone|checkout|record|status|add|remove|-h"
+OPTIONS_SPEC=
+LONG_USAGE="\
+git dep init [<name>]       enabled dependecy tracking for repository
+git dep clone               clones any missing dependencies
+git dep checkout            checks out specific revisions of dependencies
+git dep record              records current revision in all dependent repositories
+git dep status              shows status of all dependencies
+git dep add <path>          adds a new dependency
+git dep remove <name>       removes a dependency
+git dep all                 lists all tracked repositories
+"
+. git-sh-setup
+USAGEREF="Run $dashless -h for usage."
+require_work_tree
+
+say() {
+	$quiet || echo "$*"
+}
+
+# list_dependencies <config-file>
+list_dependencies() {
+  git config -f "$1" --get-regexp '^dep\..*\.commitid' | awk -F. '{ print $2 }'
+}
+
+list_repositories() {
+  git config --global --get-regexp '^repos\..*\.path' | awk -F. '{ print $2 }'
+}
+
+find_repository() {
+  git config --global --get "repos.$1.path"
+}
+
+cmd_init() {
+  # defaults
+  force=false
+  
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -f | --force)     force=true; shift;;
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                break=true;;
+    esac
+  done
+  name="$1"
+  
+  test -n "$current_name" && {
+    $force || test -z "$name" || die "Name already set. Use -f to overwrite."
+    test -n "$name" && say "Forced overwriting of old name $oldname."
+  }
+  test -z "$name" && name="$current_name"
+  test -z "$name" && name="$(basename "$(pwd)")"
+  test "$name" != "$current_name" &&
+    git config -f "$config_file" repos.name "$name"
+  git config --global "repos.$name.path" "$(pwd)"
+  
+  say "Dependency tracking initialized, repository is now known as '$name'."
+  url="$(git config remote.origin.url)"
+  test -z "$url" &&
+    echo "Warning: remote 'origin' does not exist. Dependent repositories would not
+be able to record a URL to clone from, and thus git dep clone won't work.
+It is highly recommended to set up remote 'origin'."
+  test -n "$url" &&
+    echo "
+NOTE: Dependent repositories will be setup to clone the origin URL,
+i.e. a URL pointed to by remote 'origin'. Currently it is:
+
+    $url
+
+Please check that the above address is valid, as it will be recorded in all
+dependent repositories. This URL can be changed with:
+
+    git config remote.origin.url <new-url-here>
+"
+}
+
+read_branch() {
+  branch_ref="$(cat $1/.git/HEAD)"
+  case "${branch_ref// /_}" in
+    ref:_refs/heads/*)
+      echo "${branch_ref#ref: refs/heads/}";;
+    *)
+      echo "<detached>";;
+  esac
+}
+
+record_dependency() {
+  parent_name="$1"
+  parent_config="$2"
+  child_name="$3"
+  child_dir="$4"
+
+  oldurl="$(git config -f "$parent_config" "dep.$child_name.url")"
+  oldcommitid="$(git config -f "$parent_config" "dep.$child_name.commitid")"
+  oldbranch="$(git config -f "$parent_config" "dep.$child_name.branch")"
+  
+  branch_ref="$(cat $child_dir/.git/HEAD)"
+  case "${branch_ref// /_}" in
+    ref:_refs/heads/*)
+      branch="${branch_ref#ref: refs/heads/}";;
+    ref:_*)
+      die "I kindly refuse to record a dependency on $child_name with head attached to ${branch_ref#ref: }.";;
+    *)
+      die "I kindly refuse to record a dependency on $child_name with a detached head.";;
+  esac
+  case "$branch" in
+    *-oldver)   branch="${branch%-oldver}"
+  esac
+  
+  url="$(git config -f "$child_dir/.git/config" remote.origin.url)"
+  commitid="$(export GIT_DIR="$child_dir/.git"; git-rev-parse HEAD)" ||
+    die "Cannot fetch commit id from repository $child_name".
+  say "Repository $parent_name depends on $child_name."
+  test "$commitid" != "$oldcommitid" && {
+    git config -f "$parent_config" "dep.$child_name.commitid" "$commitid" ||
+      die "Cannot write commit id to $parent_config."
+    say "  -> updated commit id: $commitid."
+  }
+  test "$url" != "$oldurl" && {
+    git config -f "$parent_config" "dep.$child_name.url" "$url" ||
+      die "Cannot write url to $parent_config."
+    say "  -> updated url: $url."
+  }
+  test "$branch" != "$oldbranch" && {
+    git config -f "$parent_config" "dep.$child_name.branch" "$branch" ||
+      die "Cannot write branch to $parent_config."
+    say "  -> updated branch: $branch."
+  }
+}
+
+cmd_add() {
+  test -f "$config_file" ||
+    die "Dependency tracking is not enabled for this repository. Please run git dep init, or git dep -h for help."
+    
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                break=true;;
+    esac
+  done
+  
+  path="$1"
+  test -z "$path" && die "Please specify a path to the repository you want to add. $USAGEREF"
+  test -d "$path" || die "Specified path does not exist: $path."
+  path="$(cd "$path"; pwd)"
+
+  test -d "$path/.git" || die "Specified path is not a Git repository: $path."
+  peer_config="$path/$deps_filename"
+  test -f "$peer_config" || die "Please run git dep init inside $path first."
+  peer_name="$(git config -f "$peer_config" repos.name)"
+  test -z "$peer_name" && die "Invalid empty peer name. Please run git dep init -f inside $path."
+  record_dependency "$current_name" "$config_file" "$peer_name" "$path"
+  
+  url="$(git config -f "$path/.git/config" remote.origin.url)"
+}
+
+cmd_remove() {
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                break=true;;
+    esac
+  done
+
+  name="$1"
+  test -z "$name" && die "Please specify a name of dependency to remove. $USAGEREF"
+  check="$(git config -f "$config_file" --get "dep.$name.commitid")"
+  test -z "$check" && die "This repository does not depend on $name. Run git dep status to see all dependencies."
+  git config -f "$config_file" --remove-section "dep.$name" ||
+    die "Failed to update $config_file."
+}
+
+cmd_record() {
+  # parse
+  break=false
+  while test $# != 0 && ! $break; do
+    case "$1" in
+      -*)               die "Invalid option $1. $USAGEREF";;
+      *)                die "No arguments expected. $USAGEREF";;
+    esac
+  done
+    
+  say "Checking repositories $current_name depends on..."
+  for dep in $(list_dependencies "$config_file"); do
+    path="$(find_repository "$dep")"
+    if test -z "$path"; then
+      echo "Dependency not found: $dep."
+      echo "  -> If you already have it somewhere, run git dep init in that folder."
+      echo "  -> If you do not have it and want to download it, run git dep clone now."
+    else
+      name="$(git config -f "$path/$deps_filename" repos.name)"
+      if test "$name" != "$dep"; then
+        echo "Dependency $dep is registered at path $path."
+        echo "However the repository found at that path is named $name."
+        echo "  -> To fix the name of repository, run git dep init -f in $path."
+        echo "  -> If you have $dep somewhere else, run git dep init in that folder."
+        echo "  -> To remove this dependency, run git dep remove $dep."
+      else
+        record_dependency "$current_name" "$config_file" "$dep" "$path"
+      fi
+    fi
+  done
+  
+  say "Checking repositories that depend on $current_name..."
+  for repos in $(list_repositories); do
+    path="$(git config --global --get "repos.$repos.path")"
+    if ! test -f "$path/$deps_filename"; then
+      echo "Skipped checking of $repos because no .$deps_filename found in it."
+    else
+      dep="$(git config -f "$path/$deps_filename" --get "dep.$current_name.commitid")"
+      test -n "$dep" &&
+        record_dependency "$repos" "$path/$deps_filename" "$current_name" "$(pwd)"
+    fi
+  done
+}
+
+cmd_all() {
+  fmt="%-15s %-15s %-4s %s\n"
+  printf "$fmt" "NAME" "BRANCH" "DEPS" "PATH"
+  for repos in $(list_repositories); do
+    path="$(git config --global --get "repos.$repos.path")"
+    if ! test -d "$path"; then
+      branch="<MISSING>"
+      deps=""
+    else
+      branch="$(read_branch "$path")"
+      if ! test -f "$path/$deps_filename"; then
+        deps="N/A"
+      else
+        deps="$(list_dependencies "$path/$deps_filename" | wc -l | sed 's/ //g')"
+      fi
+    fi
+    printf "$fmt" "$repos" "$branch" "$deps" "$path"
+  done
+}
+
+# defaults
+quiet=false
+deps_filename=.gitdeps
+config_file="$(pwd)/$deps_filename"
+
+# parse command line (until a command name is found)
+command=""
+while test $# != 0 && test -z "$command"; do
+  case "$1" in
+    -q | --quiet)     quiet=true; shift;;
+    -*)               die "Invalid option $1. $USAGEREF";;
+    init|clone|checkout|record|status|add|remove|all)
+                      command=$1; shift;;
+    *)                die "Invalid command $1. $USAGEREF";;
+  esac
+done
+test -z "$command" && command=status
+
+# global useful data
+current_name="$(git config -f "$config_file" repos.name)"
+
+cmd_$command "$@"
