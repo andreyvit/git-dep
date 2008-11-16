@@ -20,17 +20,17 @@ An real-life example we'd like to give you is a set of 6 repositories:
 
 It is important for each commit of E to save information about corresponding
 commits in S, D, L and C. Otherwise the history will be unusable, because
-compiling a historic version of E would be require long and error-prone 
+compiling a historic version of E would require long and error-prone 
 digging in its dependencies to determine the versions to check out.
 
-The same applied to other repositories with dependencies. Commits of S should
+The same applies to other repositories with dependencies. Commits of S should
 carry information about C, L and D versions. Commits of T should point to 
 suitable commits in C and L.
 
 Solving this problem is impossible with git-submodule, first because it
 requires the dependent repository to be checked out physically inside 
 the parent one (which is impossible because there are duplicate dependencies),
-second because it's command-line interface is not friendly enough for active
+second because its command-line interface is not friendly enough for active
 development (e.g. it tends to leave the HEAD detached).
 
 
